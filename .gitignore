@@ -1,19 +1,40 @@
+# Python virtual environments
 venv/
 .venv/
+ENV/
+env/
 
+# Python cache and bytecode
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
 
+# Environment and secrets
 .env
+.env.local
+.env.*.local
+*.pem
+*.key
 
+# IDEs and editors
 .vscode/
 .idea/
+*.swp
+*.swo
 
+# Logs
 *.log
+logs/
 
-.pytest_cache/
-
-data/
+# Data and vector stores
+data/*
+!data/raw/
+!data/processed/
+!data/**/.gitkeep
 qdrant_data/
 chroma/
 *.db
