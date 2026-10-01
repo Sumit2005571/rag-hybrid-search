@@ -49,6 +49,20 @@ class Settings(BaseModel):
     default_chunk_size: int = Field(default=500, description="Default chunk size in characters/tokens")
     default_chunk_overlap: int = Field(default=50, description="Default chunk overlap in characters/tokens")
 
+    # Semantic chunking
+    semantic_breakpoint_threshold: float = Field(
+        default=0.75,
+        description="Cosine-similarity threshold below which a new semantic chunk starts",
+    )
+    semantic_min_chunk_size: int = Field(
+        default=100,
+        description="Minimum character length for a semantic chunk; smaller chunks are merged",
+    )
+    semantic_max_chunk_size: int = Field(
+        default=2000,
+        description="Hard upper limit for a semantic chunk in characters",
+    )
+
     # Retrieval defaults
     top_k_dense: int = Field(default=10, description="Number of results from dense retrieval")
     top_k_sparse: int = Field(default=10, description="Number of results from sparse BM25 retrieval")
@@ -83,6 +97,9 @@ class Settings(BaseModel):
             chroma_collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"),
             default_chunk_size=int(os.getenv("DEFAULT_CHUNK_SIZE", "500")),
             default_chunk_overlap=int(os.getenv("DEFAULT_CHUNK_OVERLAP", "50")),
+            semantic_breakpoint_threshold=float(os.getenv("SEMANTIC_BREAKPOINT_THRESHOLD", "0.75")),
+            semantic_min_chunk_size=int(os.getenv("SEMANTIC_MIN_CHUNK_SIZE", "100")),
+            semantic_max_chunk_size=int(os.getenv("SEMANTIC_MAX_CHUNK_SIZE", "2000")),
             top_k_dense=int(os.getenv("TOP_K_DENSE", "10")),
             top_k_sparse=int(os.getenv("TOP_K_SPARSE", "10")),
             top_k_final=int(os.getenv("TOP_K_FINAL", "5")),

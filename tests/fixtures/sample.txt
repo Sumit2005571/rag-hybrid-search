@@ -1,0 +1,10 @@
+This is a sample plain text document for testing.
+
+It contains multiple paragraphs with some spacing.
+
+The ingestion pipeline should:
+- Load this file cleanly
+- Preserve paragraph boundaries
+- Normalize whitespace
+
+End of document.

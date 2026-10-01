@@ -31,7 +31,7 @@ def test_normalizer():
     normalizer = DocumentNormalizer()
     raw = RawDocument(
         content="  Hello   world!  \n\n\n\nNew paragraph.  ",
-        metadata=DocumentMetadata(source="test.txt", document_id="doc1"),
+        metadata=DocumentMetadata(source_file="test.txt", document_id="doc1", file_type="txt"),
     )
     normalized = normalizer.normalize(raw)
     assert normalized.content == "Hello world!\n\nNew paragraph."

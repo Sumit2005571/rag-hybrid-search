@@ -50,13 +50,15 @@ The system is designed without high-level wrapper abstractions (such as LangChai
 ### Core Components
 
 1. **Ingestion & Normalization (`app/ingestion`)**:
-   - Multi-format document loading (PDF, DOCX, TXT, Markdown).
-   - Document metadata extraction and text normalization (whitespace, control characters).
+   - Multi-format document loading (PDF, Markdown, HTML, TXT).
+   - Document metadata extraction (`source_file`, `document_id`, `section_heading`, `page_number`, `ingestion_timestamp`).
+   - Clean plaintext normalization (whitespace collapse, control character removal).
+   - Deterministic SHA-256 document IDs enabling idempotent re-indexing.
 
 2. **Chunking Strategies (`app/chunking`)**:
-   - Fixed-size sliding window with configurable overlap.
-   - Recursive structure-aware splitting using natural boundaries.
-   - Semantic chunking using sentence distance metrics.
+   - **Fixed-size** sliding window: configurable `chunk_size` and `overlap`, deterministic ordering, no missing or duplicated text.
+   - **Recursive structure-aware**: respects Markdown heading → paragraph → sentence → word → character boundaries; prefer largest natural boundary first.
+   - **Semantic**: detects topic boundaries via cosine-similarity of sentence embeddings; auto-falls back to paragraph splitting when the OpenAI key is absent or the API call fails.
 
 3. **Embeddings & Vector Storage (`app/embeddings`, `app/retrieval/dense.py`)**:
    - OpenAI `text-embedding-3-small` vector generation.
@@ -129,14 +131,20 @@ rag-hybrid-search/
 │       └── schemas.py
 ├── data/                      # Local data directory (ignored by Git)
 │   ├── raw/                   # Raw documents for ingestion
-│   └── processed/             # Preprocessed & normalized documents
-├── scripts/                   # Utility and server runner scripts
+│   ├── processed/             # Preprocessed & normalized documents
+│   └── chunks/                # Chunked documents (per-strategy output)
+├── scripts/                   # Utility and runner scripts
+│   ├── ingest.py              # CLI batch document ingestion script
+│   ├── chunk.py               # CLI batch chunking script
 │   └── run_server.py
 ├── tests/                     # Unit and integration test suite
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures and test environment
+│   ├── fixtures/              # Sample test documents (.txt, .md, .html, .pdf)
 │   ├── test_api.py            # API endpoint tests
 │   ├── test_config.py         # Configuration tests
+│   ├── test_chunking.py       # Three-strategy chunking test suite (98 tests)
+│   ├── test_ingestion.py      # Multi-format ingestion test suite
 │   ├── test_logging.py        # Logging setup tests
 │   └── test_structure.py     # Component & module tests
 ├── .env.example               # Template environment configuration
@@ -191,6 +199,213 @@ cp .env.example .env
 Ensure your `OPENAI_API_KEY` is populated in `.env`:
 ```ini
 OPENAI_API_KEY=sk-...
+```
+
+---
+
+## Document Ingestion (Phase 1)
+
+Phase 1 provides a multi-format, modular document ingestion pipeline that normalizes documents into clean plaintext with rich metadata preservation and deterministic ID generation for idempotent reprocessing.
+
+### Supported Formats
+
+| Format | Extension | Loader | Extracted Features & Metadata |
+|---|---|---|---|
+| **Plain Text** | `.txt` | `TextLoader` | Preserves paragraph boundaries, normalizes whitespace, UTF-8/Latin-1 fallback. |
+| **Markdown** | `.md` | `MarkdownLoader` | Parses heading hierarchy (`#`, `##`, `###`), splits into section documents with `section_heading` preserved. |
+| **HTML** | `.html`, `.htm` | `HTMLLoader` | Strips noise elements (`<script>`, `<style>`, `<nav>`, `<footer>`, `<header>`, `<aside>`, etc.), extracts `<title>`, preserves headings. |
+| **PDF** | `.pdf` | `PDFLoader` | Extracts text page-by-page using PyMuPDF (`fitz`), tracking `page_number` (1-indexed) and `total_pages`. |
+
+### Preserved Metadata Schema
+
+Each ingested document is structured into a `RawDocument` containing:
+- `source_file`: Absolute path of the source file.
+- `document_id`: Deterministic 16-character SHA-256 hash based on `source_file` and page/section index.
+- `file_type`: Format extension (`txt`, `md`, `html`, `pdf`).
+- `title`: Document or page title where available.
+- `section_heading`: Heading name for structured Markdown/HTML sections.
+- `page_number`: 1-indexed page number for PDFs.
+- `total_pages`: Total page count for paginated files.
+- `ingestion_timestamp`: ISO-8601 UTC timestamp.
+- `extra`: Arbitrary extensible metadata dictionary.
+
+### CLI Batch Ingestion
+
+Raw source documents are stored in `data/raw/` and processed JSON documents are saved to `data/processed/`.
+
+```bash
+# Ingest all supported documents from data/raw into data/processed
+python scripts/ingest.py --input data/raw --output data/processed
+
+# Verbose logging
+python scripts/ingest.py --input data/raw --output data/processed --log-level DEBUG
+```
+
+Output files in `data/processed/` are named `<document_id>.json` formatted as:
+```json
+{
+  "content": "Normalized text content...",
+  "metadata": {
+    "source_file": "...",
+    "document_id": "...",
+    "file_type": "...",
+    "page_number": 1,
+    "section_heading": null,
+    "ingestion_timestamp": "..."
+  }
+}
+```
+
+Because IDs are deterministic, re-running ingestion reprocesses the raw documents in-place without duplicate artifacts or requiring re-uploading.
+
+### Programmatic Usage
+
+```python
+from pathlib import Path
+from app.ingestion.loaders import DocumentLoader
+from app.ingestion.normalizer import DocumentNormalizer
+
+loader = DocumentLoader()
+normalizer = DocumentNormalizer()
+
+# Load and normalize any supported file
+raw_docs = loader.load(Path("data/raw/sample.pdf"))
+for raw_doc in raw_docs:
+    clean_doc = normalizer.normalize(raw_doc)
+    print(f"[{clean_doc.metadata.file_type}] Page {clean_doc.metadata.page_number}: {clean_doc.content[:100]}...")
+```
+
+---
+
+## Chunking Strategies (Phase 1B)
+
+The chunking pipeline converts ingested `data/processed/*.json` documents into
+fixed-size text windows suitable for embedding and retrieval.  Three strategies
+are provided; all implement the same `BaseChunker` interface and produce
+consistent `Chunk` objects.
+
+### Strategy A — Fixed-Size (`fixed`)
+
+Slides a window of exactly `chunk_size` characters across the document,
+advancing by `chunk_size − overlap` characters per step.  Every character
+appears in at least one chunk; the overlap region appears in exactly two
+consecutive chunks.
+
+```
+|<------ chunk_size ------>|
+        |<------ chunk_size ------>|
+|<-ov-->|                 |<-ov-->|
+```
+
+**Best for:** Documents without clear structure where uniform context windows
+are desired.
+
+### Strategy B — Recursive Structure-Aware (`recursive`)
+
+Tries separators in priority order:
+1. `\n## ` / `\n# ` (Markdown headings)
+2. `\n\n` (paragraph breaks)
+3. `\n` (line breaks)
+4. `". "` / `"? "` / `"! "` (sentence boundaries)
+5. `" "` (word boundary)
+6. `""` (hard character split — last resort)
+
+Any segment that still exceeds `chunk_size` after the current separator is
+recursively split with the next separator in the list.
+
+**Best for:** Structured documents (Markdown, reports) where respecting section
+boundaries preserves semantic coherence.
+
+### Strategy C — Semantic (`semantic`)
+
+1. Splits the document into sentences.
+2. Embeds each sentence via the configured OpenAI model (`text-embedding-3-small`).
+3. Computes cosine similarity between consecutive sentence embeddings.
+4. Declares a chunk boundary wherever similarity drops below `SEMANTIC_BREAKPOINT_THRESHOLD`.
+5. Enforces `SEMANTIC_MIN_CHUNK_SIZE` (merge short chunks) and `SEMANTIC_MAX_CHUNK_SIZE` (re-split long chunks).
+6. **Graceful fallback:** If no API key is set or the embedding call fails, the
+   strategy transparently falls back to paragraph-boundary splitting.
+
+**Best for:** Long-form text where topic shifts don't align with structural markers.
+
+### Configuration
+
+All settings can be overridden via environment variables (see `.env.example`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEFAULT_CHUNK_SIZE` | `500` | Target max characters per chunk (fixed & recursive) |
+| `DEFAULT_CHUNK_OVERLAP` | `50` | Character overlap between consecutive chunks |
+| `SEMANTIC_BREAKPOINT_THRESHOLD` | `0.75` | Cosine-similarity threshold for topic boundary detection |
+| `SEMANTIC_MIN_CHUNK_SIZE` | `100` | Minimum characters per semantic chunk (smaller chunks are merged) |
+| `SEMANTIC_MAX_CHUNK_SIZE` | `2000` | Hard maximum characters per semantic chunk |
+
+### CLI Batch Chunking
+
+First ingest documents, then chunk them:
+
+```bash
+# 1. Ingest raw documents
+python scripts/ingest.py --input data/raw --output data/processed
+
+# 2. Chunk with fixed-size strategy (default params from Settings)
+python scripts/chunk.py --strategy fixed
+
+# 3. Chunk with recursive strategy, custom parameters
+python scripts/chunk.py --strategy recursive --chunk-size 300 --overlap 30
+
+# 4. Chunk with semantic strategy
+python scripts/chunk.py --strategy semantic --threshold 0.7
+
+# 5. Custom input/output directories
+python scripts/chunk.py --strategy fixed --input data/processed --output data/chunks
+
+# 6. Verbose logging
+python scripts/chunk.py --strategy recursive --log-level DEBUG
+```
+
+### Chunk Output Format
+
+Each chunk is written as `data/chunks/<chunk_id>.json`:
+
+```json
+{
+  "chunk_id": "abc123#c0",
+  "document_id": "abc123",
+  "source_file": "/abs/path/to/document.pdf",
+  "chunk_index": 0,
+  "start_char": 0,
+  "end_char": 487,
+  "text": "This is the first chunk of text...",
+  "char_count": 487,
+  "section_heading": "## Introduction",
+  "page_number": 1,
+  "strategy": "fixed",
+  "metadata": {}
+}
+```
+
+### Programmatic Usage
+
+```python
+from app.chunking import FixedSizeChunker, RecursiveStructureChunker, SemanticChunker
+
+# Fixed-size
+chunker = FixedSizeChunker(chunk_size=500, chunk_overlap=50)
+chunks = chunker.chunk(
+    text=doc.content,
+    document_id=doc.metadata.document_id,
+    metadata={"source_file": doc.metadata.source_file, "page_number": doc.metadata.page_number},
+)
+
+# Recursive
+chunker = RecursiveStructureChunker(chunk_size=500, chunk_overlap=50)
+
+# Semantic (with injected embedding function for tests)
+chunker = SemanticChunker(
+    breakpoint_threshold=0.75,
+    embedding_fn=my_embed_fn,   # optional; uses OpenAI by default
+)
 ```
 
 ---
