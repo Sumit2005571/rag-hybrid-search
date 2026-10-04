@@ -449,3 +449,119 @@ pytest -v
 - **Zero Secrets in Git**: Secrets, `.env` files, local SQLite/Chroma databases, and raw document directories are excluded via `.gitignore`.
 - **Modular Design**: Every component implements typed interfaces and can be unit tested in isolation without external API dependencies.
 - **Fail-Safe Generation**: Built-in verification and abstention mechanisms prevent ungrounded hallucinations from being served to end-users.
+
+---
+
+## Phase 2.1 — Embeddings and ChromaDB
+
+### Why embeddings?
+
+Dense vector embeddings convert text into high-dimensional numerical vectors where semantically similar passages map to nearby points in vector space.  This enables semantic search: a query about "machine learning" can retrieve chunks about "neural networks" even when none of those exact words appear in the query — something keyword search cannot do.
+
+### Why ChromaDB?
+
+[ChromaDB](https://www.trychroma.com/) is an open-source, embeddable vector database that:
+- Stores embeddings and metadata together with full persistence.
+- Supports fast approximate nearest-neighbour search.
+- Runs entirely locally — no external service required.
+- Survives application restarts via its persistent storage backend.
+
+### Embedding model
+
+| Setting | Value |
+|---|---|
+| Model | `text-embedding-3-small` |
+| Provider | OpenAI |
+| Dimensions | 1536 |
+| Batching | Configurable (default 100 chunks per API call) |
+
+### Configuration
+
+All settings can be provided via environment variables or a `.env` file:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | *(required)* | OpenAI API key for embedding calls |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
+| `CHROMA_PERSIST_DIRECTORY` | `./data/chroma` | Where ChromaDB persists its data |
+| `CHROMA_COLLECTION_NAME` | `rag_documents` | ChromaDB collection to use |
+| `EMBEDDING_BATCH_SIZE` | `100` | Chunks sent per embedding API request |
+
+### Setting OPENAI_API_KEY
+
+1. Copy the example env file:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and replace the placeholder:
+   ```
+   OPENAI_API_KEY=sk-your-real-key-here
+   ```
+
+3. The application reads this file automatically on startup via `python-dotenv`.
+
+> **Never commit real API keys.** `.env` is listed in `.gitignore`.
+
+### How persistent storage works
+
+ChromaDB writes its data files under `data/chroma/` (configurable).  Once the indexing script has run, this directory contains a fully queryable vector store that survives application restarts.  The `data/chroma/` path is excluded from Git to prevent committing large binary files.
+
+### How to run the indexing CLI
+
+After ingesting and chunking your documents:
+
+```bash
+# Step 1 – Ingest raw documents
+python scripts/ingest.py --input data/raw --output data/processed
+
+# Step 2 – Chunk them (choose a strategy)
+python scripts/chunk.py --strategy fixed --input data/processed --output data/chunks
+
+# Step 3 – Embed and index into ChromaDB
+python scripts/index.py --input data/chunks
+```
+
+**Example with all options:**
+
+```bash
+python scripts/index.py \
+    --input data/chunks \
+    --chroma-dir data/chroma \
+    --collection rag_documents \
+    --model text-embedding-3-small \
+    --batch-size 50 \
+    --log-level INFO
+```
+
+The script will:
+1. Load all chunk JSON files from `--input`.
+2. Validate them against the `Chunk` schema.
+3. Batch-embed chunk text via the OpenAI API.
+4. Upsert all chunks into the ChromaDB collection.
+5. Print a progress + summary report.
+6. Exit with code `0` on full success, `1` on partial or total failure.
+
+### How idempotent indexing works
+
+Chunks are identified by a **deterministic ID** (e.g. `abc123#c5`) derived from the document ID, chunk strategy, and chunk position.  ChromaDB's `upsert` operation is used for all writes.
+
+Running the indexing script on the same corpus twice:
+- Generates the **same IDs** for the same chunks.
+- **Overwrites** existing records rather than creating duplicates.
+- Results in the same collection count after both runs.
+
+### Running the tests
+
+```bash
+# All tests (unit + integration, no live API required)
+python -m pytest
+
+# Phase 2.1 tests only
+python -m pytest tests/test_indexing.py -v
+
+# Verbose output for the full suite
+python -m pytest -v
+```
+
+All Phase 2.1 tests mock the OpenAI embedding API — no real API key is needed to run them.  Live integration tests (if added later) should be placed in a separate `tests/integration/` directory and clearly labelled.
