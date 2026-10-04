@@ -565,3 +565,44 @@ python -m pytest -v
 ```
 
 All Phase 2.1 tests mock the OpenAI embedding API — no real API key is needed to run them.  Live integration tests (if added later) should be placed in a separate `tests/integration/` directory and clearly labelled.
+
+---
+
+## Phase 2.2 — BM25 Sparse Retrieval
+
+### What is BM25?
+
+BM25 (Best Matching 25) is a sparse retrieval algorithm that scores documents based on exact keyword matches. Unlike dense embeddings (which understand meaning/semantics), BM25 relies on exact lexical matches.
+
+### Why BM25 complements dense retrieval
+
+Dense retrieval can struggle with:
+- Exact part numbers or error codes (e.g., `HTTP 500`)
+- Variable names or configuration keys (e.g., `DATABASE_URL`)
+- Function signatures (e.g., `get_user_by_id`)
+
+BM25 solves this by excelling at exact technical keyword searches. In Phase 2.3, the results of both retrievers will be fused together.
+
+### Implementation Details
+
+- **Canonical Chunks**: BM25 uses the *exact same* chunk JSON objects as the ChromaDB indexing pipeline. No re-chunking occurs.
+- **Persistence**: The index is stored locally as a JSON metadata file and a Pickled model in `./data/bm25/`.
+- **Idempotency**: Running the index builder multiple times performs a deterministic full rebuild, replacing the existing index and avoiding duplicate records.
+- **Tokenization**: Our custom tokenizer splits on punctuation but deliberately preserves underscores and dots for technical identifiers (`HTTP_500`, `v1.2.3`).
+
+> **Note**: Dense retrieval and BM25 currently exist as separate retrieval mechanisms. Reciprocal Rank Fusion (RRF) has NOT yet been implemented. Reranking has NOT yet been implemented.
+
+### How to use BM25
+
+1. Generate your processed chunks first (see Phase 2.1).
+2. Build the BM25 index:
+
+```bash
+python scripts/index_bm25.py --input data/chunks
+```
+
+3. Search the index:
+
+```bash
+python scripts/search_bm25.py --query "DATABASE_URL" --top-k 5
+```

@@ -1,0 +1,4 @@
+This is a technical document.
+If you encounter HTTP 500, check the DATABASE_URL environment variable.
+Ensure you use the get_user_by_id function instead of querying the database directly.
+The MAX_RETRIES constant is set to 3.

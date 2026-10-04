@@ -1,0 +1,15 @@
+{
+  "content": "This is a technical document.\nIf you encounter HTTP 500, check the DATABASE_URL environment variable.\nEnsure you use the get_user_by_id function instead of querying the database directly.\nThe MAX_RETRIES constant is set to 3.",
+  "metadata": {
+    "source_file": "C:\\Users\\hp\\Documents\\rag-hybrid-search\\data\\raw\\sample_tech.txt",
+    "document_id": "aa6fa04920691441",
+    "file_type": "txt",
+    "title": "sample_tech.txt",
+    "author": null,
+    "page_number": null,
+    "total_pages": null,
+    "section_heading": null,
+    "ingestion_timestamp": "2026-10-04T11:54:36.470423+00:00",
+    "extra": {}
+  }
+}

@@ -38,5 +38,6 @@ data/*
 qdrant_data/
 chroma/
 data/chroma/
+data/bm25/
 *.db
 *.sqlite

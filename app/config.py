@@ -44,6 +44,10 @@ class Settings(BaseModel):
         default="rag_documents",
         description="ChromaDB collection name"
     )
+    bm25_index_directory: str = Field(
+        default="./data/bm25",
+        description="Local directory where the BM25 sparse index is persisted"
+    )
 
     # Chunking defaults
     default_chunk_size: int = Field(default=500, description="Default chunk size in characters/tokens")
@@ -95,6 +99,7 @@ class Settings(BaseModel):
             data_dir=os.getenv("DATA_DIR", "./data"),
             chroma_persist_directory=os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/chroma"),
             chroma_collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"),
+            bm25_index_directory=os.getenv("BM25_INDEX_DIRECTORY", "./data/bm25"),
             default_chunk_size=int(os.getenv("DEFAULT_CHUNK_SIZE", "500")),
             default_chunk_overlap=int(os.getenv("DEFAULT_CHUNK_OVERLAP", "50")),
             semantic_breakpoint_threshold=float(os.getenv("SEMANTIC_BREAKPOINT_THRESHOLD", "0.75")),

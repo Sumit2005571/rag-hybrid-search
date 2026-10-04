@@ -6,11 +6,17 @@ from app.config import get_settings
 
 
 class RetrievalResult(BaseModel):
-    """Schema for individual retrieved candidate items."""
+    """Schema for individual retrieved candidate items.
+
+    Shared by dense (ChromaDB) and sparse (BM25) retrieval paths so that
+    RRF fusion can operate over a single unified result type.
+    """
 
     chunk_id: str = Field(..., description="ID of retrieved chunk")
+    document_id: str = Field(default="", description="Parent document ID")
     text: str = Field(..., description="Text content of chunk")
     score: float = Field(..., description="Similarity or relevance score")
+    rank: int = Field(default=0, description="1-indexed rank within the result list (0 = unranked)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Metadata associated with chunk")
 
 
