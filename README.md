@@ -416,14 +416,22 @@ chunker = SemanticChunker(
 
 ## Running the API Server
 
-Start the FastAPI application via uvicorn or the runner script:
+> **Prerequisites before starting the server:**
+> 1. `OPENAI_API_KEY` must be set in your `.env` file.
+> 2. The ChromaDB index must be populated (run the ingestion and chunking scripts first).
+> 3. The BM25 index must exist at `BM25_INDEX_DIRECTORY` (built during indexing).
+>
+> The server will start without these, but `/api/v1/query` will return HTTP 503
+> until both indexes are available.
+
+Start the FastAPI application via uvicorn:
 
 ```bash
-# Using Python runner script
-python -m scripts.run_server
-
-# Or directly with Uvicorn
+# Development (auto-reload)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Production
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
 Interactive API documentation will be available at:
@@ -433,9 +441,170 @@ Interactive API documentation will be available at:
 
 ---
 
+## Phase 3 — End-to-End Query Flow (This Milestone)
+
+Phase 3 wires the full RAG pipeline into the `/api/v1/query` endpoint:
+hybrid retrieval → grounded LLM generation → citation extraction & verification → confidence assessment.
+
+### Request-to-Answer Flow
+
+```
+POST /api/v1/query
+  │
+  ├─ 1. Validate request (Pydantic)
+  ├─ 2. Build HybridRetriever
+  │       ├─ EmbeddingGenerator (OpenAI text-embedding-3-small)
+  │       ├─ DenseRetriever (ChromaDB kNN)
+  │       └─ BM25SparseStore (persisted BM25 index)
+  ├─ 3. retrieve(query, top_k, use_reranker)
+  │       ├─ Dense search → ChromaDB
+  │       ├─ Sparse search → BM25
+  │       ├─ RRF fusion
+  │       └─ Cross-encoder reranking (optional)
+  ├─ 4. RAGGenerator.generate(question, retrieved_contexts)
+  │       ├─ Build grounded prompt (system + user)
+  │       ├─ openai.ChatCompletion.create (gpt-4o-mini)
+  │       ├─ CitationExtractor — find [Chunk: <id>] markers
+  │       ├─ CitationVerifier — drop markers not in retrieved set
+  │       └─ ConfidenceScorer — avg retrieval score vs threshold
+  └─ 5. Return QueryResponse
+          ├─ answer (LLM text)
+          ├─ citations (CitationItem[]: chunk_id, source, text_snippet)
+          ├─ confidence_score (avg retrieval relevance)
+          ├─ abstained (bool)
+          ├─ verification_score (fraction of valid citations)
+          └─ retrieved_chunks (full chunk list for inspection)
+```
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `OPENAI_API_KEY` | **Yes** | — | OpenAI key for embeddings and chat completion |
+| `OPENAI_EMBEDDING_MODEL` | No | `text-embedding-3-small` | Embedding model |
+| `OPENAI_CHAT_MODEL` | No | `gpt-4o-mini` | Chat completion model |
+| `CHROMA_PERSIST_DIRECTORY` | No | `./data/chroma` | ChromaDB data directory |
+| `CHROMA_COLLECTION_NAME` | No | `rag_documents` | ChromaDB collection |
+| `BM25_INDEX_DIRECTORY` | No | `./data/bm25` | BM25 index directory |
+| `TOP_K_DENSE` | No | `10` | Dense retrieval candidates |
+| `TOP_K_SPARSE` | No | `10` | Sparse retrieval candidates |
+| `TOP_K_FINAL` | No | `5` | Final results after reranking |
+| `CONFIDENCE_THRESHOLD` | No | `0.7` | Abstention threshold (avg retrieval score) |
+| `CROSS_ENCODER_MODEL` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranking model |
+
+### Indexing Prerequisites
+
+Before calling `/api/v1/query` with real data:
+
+```bash
+# Step 1 — Ingest raw documents
+python scripts/ingest.py --input data/raw --output data/processed
+
+# Step 2 — Chunk documents
+python scripts/chunk.py --strategy fixed
+
+# Step 3 — Embed and index into ChromaDB + build BM25 index
+#   (Uses the ChunkIndexer; run after chunking)
+python -c "
+from app.retrieval.indexer import ChunkIndexer
+indexer = ChunkIndexer()
+indexer.index_from_directory('data/chunks')
+"
+```
+
+> **Note:** Dense retrieval requires a populated ChromaDB collection.  Sparse
+> retrieval requires a persisted BM25 index.  If only one index is available,
+> the pipeline degrades gracefully: failed retrieval legs return empty lists and
+> the fusion step works with whatever is available.
+
+### Example API Requests
+
+**Health check:**
+```bash
+curl http://localhost:8000/health
+```
+
+**Query (grounded answer):**
+```bash
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What is Reciprocal Rank Fusion?",
+    "top_k": 5,
+    "use_reranker": true
+  }'
+```
+
+**Example response (with populated index):**
+```json
+{
+  "query": "What is Reciprocal Rank Fusion?",
+  "answer": "Reciprocal Rank Fusion (RRF) is a score fusion method ... [Chunk: doc1#c3]",
+  "citations": [
+    {
+      "chunk_id": "doc1#c3",
+      "source": "rag_overview.pdf",
+      "text_snippet": "RRF combines ranked lists by summing 1/(k + rank) ..."
+    }
+  ],
+  "confidence_score": 0.87,
+  "abstained": false,
+  "verification_score": 1.0,
+  "retrieved_chunks": [
+    {
+      "chunk_id": "doc1#c3",
+      "document_id": "doc1",
+      "text": "RRF combines ranked lists ...",
+      "score": 0.87,
+      "rank": 1,
+      "metadata": {"source_file": "rag_overview.pdf"}
+    }
+  ]
+}
+```
+
+**Abstention (when context is insufficient):**
+```json
+{
+  "query": "What is the population of Mars?",
+  "answer": "I don't know based on the provided documents.",
+  "citations": [],
+  "confidence_score": 0.0,
+  "abstained": true,
+  "verification_score": null,
+  "retrieved_chunks": []
+}
+```
+
+### Abstention and Confidence
+
+The `confidence_score` is the **average retrieval relevance score** of the
+returned chunks, not a calibrated probability of correctness.  The system
+abstains (`abstained: true`) when:
+
+1. No chunks are retrieved (score = 0).
+2. The average retrieval score is below `CONFIDENCE_THRESHOLD` (default 0.7).
+3. The generated answer contains uncertainty phrases like "I don't know".
+4. The OpenAI API key is missing or the API call fails.
+
+### Citation Verification
+
+Citations are extracted from the model's output using the `[Chunk: <id>]` marker
+format.  Each cited chunk ID is checked against the set of actually retrieved
+chunks.  Citations to non-retrieved chunks (hallucinations) are **removed
+before the response is returned**.  The `verification_score` field reports the
+fraction of extracted citations that passed verification (1.0 = all citations
+grounded, 0.0 = all hallucinated).
+
+> **Unverified integration note:** Live end-to-end generation requires a valid
+> `OPENAI_API_KEY` and a populated index.  All tests in this milestone use mocks
+> and do not call the real OpenAI API or real ChromaDB.
+
+---
+
 ## Running Tests
 
-Run the full test suite using `pytest` (273 tests, no API key or network required):
+Run the full test suite using `pytest` (304 tests, no API key or network required):
 
 ```bash
 # Windows (venv)
@@ -446,6 +615,23 @@ python -m pytest tests/ -v
 ```
 
 All tests use mocks — no OpenAI credits, no real cross-encoder download, no live ChromaDB writes outside `tmp_path`.
+
+Key test files:
+
+| File | Description | Tests |
+|---|---|---|
+| `test_query_flow.py` | Full /query pipeline, RAGGenerator, citations, abstention | 34 |
+| `test_hybrid.py` | Hybrid retrieval, RRF, cross-encoder reranker | 44 |
+| `test_indexing.py` | Embeddings + ChromaDB indexing | 44 |
+| `test_bm25.py` | BM25 sparse retrieval | 24 |
+| `test_chunking.py` | Three-strategy chunking | 98 |
+| `test_api.py` | FastAPI endpoint smoke tests | 4 |
+
+To run only the query-flow test suite:
+
+```bash
+.\venv\Scripts\python.exe -m pytest tests/test_query_flow.py -v
+```
 
 To run only the hybrid-retrieval test suite:
 
