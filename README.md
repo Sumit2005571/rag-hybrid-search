@@ -108,12 +108,15 @@ rag-hybrid-search/
 │   ├── embeddings/            # OpenAI dense embeddings
 │   │   ├── __init__.py
 │   │   └── openai_embeddings.py
-│   ├── retrieval/             # Dense, sparse, RRF, and cross-encoder reranking
+│   ├── retrieval/             # Dense, sparse, hybrid RRF, and cross-encoder reranking
 │   │   ├── __init__.py
-│   │   ├── dense.py
-│   │   ├── sparse.py
-│   │   ├── fusion.py
-│   │   └── reranker.py
+│   │   ├── dense.py           # DenseRetriever — ChromaDB kNN search
+│   │   ├── sparse.py          # BM25SparseStore — BM25 lexical index
+│   │   ├── fusion.py          # ReciprocalRankFusion — RRF merging
+│   │   ├── reranker.py        # CrossEncoderReranker — lazy-loaded CE model
+│   │   ├── hybrid.py          # HybridRetriever — full pipeline orchestration
+│   │   ├── indexer.py         # ChunkIndexer — embed + upsert to ChromaDB
+│   │   └── vector_store.py    # VectorStore — ChromaDB abstraction
 │   ├── generation/            # Prompts, generator, citations, verification, confidence
 │   │   ├── __init__.py
 │   │   ├── prompts.py
@@ -141,12 +144,13 @@ rag-hybrid-search/
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures and test environment
 │   ├── fixtures/              # Sample test documents (.txt, .md, .html, .pdf)
-│   ├── test_api.py            # API endpoint tests
-│   ├── test_config.py         # Configuration tests
+│   ├── test_bm25.py           # BM25 sparse retrieval test suite (24 tests)
 │   ├── test_chunking.py       # Three-strategy chunking test suite (98 tests)
+│   ├── test_hybrid.py         # Hybrid retrieval, RRF, reranker tests (44 tests)
+│   ├── test_indexing.py       # Embeddings + ChromaDB indexing tests (44 tests)
 │   ├── test_ingestion.py      # Multi-format ingestion test suite
 │   ├── test_logging.py        # Logging setup tests
-│   └── test_structure.py     # Component & module tests
+│   └── test_structure.py      # Component & module tests
 ├── .env.example               # Template environment configuration
 ├── .gitignore                 # Git ignore rules
 ├── pytest.ini                 # Pytest configuration
@@ -431,15 +435,22 @@ Interactive API documentation will be available at:
 
 ## Running Tests
 
-Run the test suite using `pytest`:
+Run the full test suite using `pytest` (273 tests, no API key or network required):
 
 ```bash
-pytest
+# Windows (venv)
+.\venv\Scripts\python.exe -m pytest tests/ -v
+
+# Linux / macOS
+python -m pytest tests/ -v
 ```
 
-To run with verbose output:
+All tests use mocks — no OpenAI credits, no real cross-encoder download, no live ChromaDB writes outside `tmp_path`.
+
+To run only the hybrid-retrieval test suite:
+
 ```bash
-pytest -v
+.\venv\Scripts\python.exe -m pytest tests/test_hybrid.py -v
 ```
 
 ---
@@ -590,7 +601,7 @@ BM25 solves this by excelling at exact technical keyword searches. In Phase 2.3,
 - **Idempotency**: Running the index builder multiple times performs a deterministic full rebuild, replacing the existing index and avoiding duplicate records.
 - **Tokenization**: Our custom tokenizer splits on punctuation but deliberately preserves underscores and dots for technical identifiers (`HTTP_500`, `v1.2.3`).
 
-> **Note**: Dense retrieval and BM25 currently exist as separate retrieval mechanisms. Reciprocal Rank Fusion (RRF) has NOT yet been implemented. Reranking has NOT yet been implemented.
+> **Updated in Phase 2.3**: Dense retrieval, BM25 sparse retrieval, Reciprocal Rank Fusion (RRF), and cross-encoder reranking are now fully integrated via ``HybridRetriever``.
 
 ### How to use BM25
 
@@ -605,4 +616,104 @@ python scripts/index_bm25.py --input data/chunks
 
 ```bash
 python scripts/search_bm25.py --query "DATABASE_URL" --top-k 5
+```
+
+
+---
+
+## Phase 2.3 — Hybrid Retrieval, RRF, and Cross-Encoder Reranking
+
+### Overview
+
+Phase 2.3 completes the retrieval stage by wiring dense and sparse search
+together into a unified hybrid pipeline with two-stage ranking:
+
+1. **Dense retrieval** — ChromaDB kNN over OpenAI embeddings (`DenseRetriever`)
+2. **Sparse retrieval** — BM25 lexical keyword search (`BM25SparseStore`)
+3. **Reciprocal Rank Fusion** — merges the two ranked lists, deduplicates shared
+   chunks, and produces a single RRF-scored list (`ReciprocalRankFusion`)
+4. **Cross-encoder reranking** — each (query, chunk-text) pair is scored by a
+   local `sentence-transformers` cross-encoder model; results are re-ordered by
+   cross-encoder relevance (`CrossEncoderReranker`)
+
+### Key design decisions
+
+| Decision | Rationale |
+|---|---|
+| **Lazy model loading** | The cross-encoder is only loaded on the first `rerank()` call, so importing the package does not trigger a model download. |
+| **No silent fallback** | If the cross-encoder fails to load or score, `CrossEncoderError` is raised; callers choose whether to fall back to RRF ordering. |
+| **Unified result type** | `RetrievalResult` is shared by dense, sparse, RRF, and reranker paths — no conversion needed. |
+| **Graceful degradation** | `HybridRetriever` catches dense/sparse failures individually; if one path fails, the other still contributes. |
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TOP_K_DENSE` | `10` | Candidates from dense retrieval |
+| `TOP_K_SPARSE` | `10` | Candidates from sparse BM25 |
+| `TOP_K_FINAL` | `5` | Final results after reranking |
+| `RRF_K` | `60` | RRF constant *k* |
+| `CROSS_ENCODER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Hugging Face cross-encoder |
+
+### End-to-end pipeline (full workflow)
+
+```bash
+# 1. Ingest raw documents
+python scripts/ingest.py --input data/raw --output data/processed
+
+# 2. Chunk documents
+python scripts/chunk.py --strategy fixed --input data/processed --output data/chunks
+
+# 3. Embed + index into ChromaDB (requires OPENAI_API_KEY)
+python scripts/index.py --input data/chunks
+
+# 4. Build the BM25 sparse index
+python scripts/index_bm25.py --input data/chunks
+
+# 5. Run the test suite (no network or API key needed)
+.\\venv\\Scripts\\python.exe -m pytest tests/ -v
+```
+
+### Programmatic usage
+
+```python
+from app.retrieval import (
+    DenseRetriever,
+    HybridRetriever,
+    CrossEncoderReranker,
+)
+from app.retrieval.sparse import BM25SparseStore
+from app.embeddings.embeddings import EmbeddingGenerator
+
+# Set up components
+embedding_gen = EmbeddingGenerator(api_key="sk-...")
+dense = DenseRetriever()          # uses config defaults for ChromaDB path
+sparse = BM25SparseStore()
+sparse.load_index()               # loads from data/bm25/
+
+reranker = CrossEncoderReranker() # loads lazily on first rerank() call
+
+retriever = HybridRetriever(
+    dense_retriever=dense,
+    sparse_store=sparse,
+    embedding_generator=embedding_gen,
+    reranker=reranker,
+)
+
+results = retriever.retrieve("What is DATABASE_URL?", top_k=5)
+for r in results:
+    print(f"[{r.score:.4f}] {r.chunk_id}: {r.text[:80]}")
+```
+
+### Test suite (44 tests — all mocked)
+
+| Class | Coverage |
+|---|---|
+| `TestReciprocalRankFusion` | RRF ordering, score formula, duplicates, empty lists, metadata preservation |
+| `TestCrossEncoderReranker` | Lazy load, score ordering, top_k, load failure, inference failure, cached errors |
+| `TestDenseRetriever` | Empty collection, result fields, score conversion, top_k guards |
+| `TestHybridRetriever` | Integration, empty query, use_reranker flag, graceful degradation, metadata |
+
+```bash
+.\\venv\\Scripts\\python.exe -m pytest tests/test_hybrid.py -v
 ```

@@ -32,6 +32,7 @@ class ReciprocalRankFusion:
             fused_results.append(
                 RetrievalResult(
                     chunk_id=original.chunk_id,
+                    document_id=original.document_id,
                     text=original.text,
                     score=fused_score,
                     metadata=original.metadata,
